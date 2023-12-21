@@ -1,5 +1,5 @@
 # ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
-# 使用resnet模型进行训练cifar10
+# 使用resnet模型进行训练cifar10。笔记本单卡跑不起来。
 # usage: python train-resnet18-cifar10.py
 # ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 import os
@@ -13,17 +13,18 @@ from torchvision import datasets, transforms
 from resnet import Resnet18
 
 # 参数 ==========================================================================
-data_dir = '../data/cifar10/'  # 需修改
-save_folder = "../output/resnet18-cifar10-01/"
-os.makedirs(save_folder)
+data_dir = '../data/miniImagenet/'  # 需修改
+save_folder = "../output/resnet18-miniImagenet-01/"
+if not os.path.exists(save_folder):
+    os.makedirs(save_folder)
 best_model_path = os.path.join(save_folder, "best_model.pth")
 latest_model_path = os.path.join(save_folder, "latest_model.pth")
 
-num_epochs = 3  # 需修改
+num_epochs = 2  # 需修改
 start_lr = 0.01
-batch_size = 64*1  # 需修改，每个GPU上的图像数量×GPU数量
+batch_size = 48*4  # 需修改，每个GPU上的图像数量×GPU数量
 
-os.environ['CUDA_VISIBLE_DEVICES'] = "0"
+os.environ['CUDA_VISIBLE_DEVICES'] = "0,1,2,3"
 gpus = [i for i in range(torch.cuda.device_count())]
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
@@ -125,7 +126,7 @@ model = nn.DataParallel(model, device_ids=gpus)
 
 criterion = nn.CrossEntropyLoss()
 optimizer = torch.optim.SGD(model.parameters(), lr=start_lr, momentum=0.9)
-step_lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.2)
+step_lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.2)
 
 # Train
 train_model(model, criterion, optimizer, step_lr_scheduler, num_epochs=num_epochs)
