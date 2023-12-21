@@ -53,7 +53,7 @@ class Resnet18(nn.Module):
         # head
         self.avgpool = nn.AdaptiveAvgPool2d(output_size=(1,1))
         self.fc = nn.Linear(512, out_features=num_classes)
-        self.softmax = nn.Softmax()
+        self.softmax = nn.Softmax(-1)  # 按行计算
 
     def _make_layer(self, num_block, in_dim, out_dim, stride):
         layer = []
@@ -71,7 +71,9 @@ class Resnet18(nn.Module):
         x = self.avgpool(x)
         x = torch.flatten(x, 1)
         x = self.fc(x)
-        x = self.softmax(x)
+        # 交叉熵损失函数会自动对输入模型的预测值进行softmax计算。
+        # refer: https://zhuanlan.zhihu.com/p/580367698?utm_id=0
+        # x = self.softmax(x)  
         return x
 
     def residual(self):

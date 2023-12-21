@@ -1,6 +1,8 @@
 # ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
-# 使用resnet模型进行训练cifar10。笔记本单卡跑不起来。
-# usage: python train-resnet18-cifar10.py
+# 使用resnet模型进行训练miniImageNet
+# 使用DataParallel训练速度要慢很多（一半），10个epoch约8分钟；但单卡占用的显存少，可以使用更大的batchsize（2倍）
+# https://zhuanlan.zhihu.com/p/113694038?utm_id=0&wd=&eqid=98b9f81a000c0f36000000046466449a
+# usage: python train-resnet18-miniimagenet-dp.py
 # ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 import os
 import copy
@@ -11,6 +13,10 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 from resnet import Resnet18
+import multiprocessing
+# from apex import amp
+
+torch.backends.cudnn.benchmark = True
 
 # 参数 ==========================================================================
 data_dir = '../data/miniImagenet/'  # 需修改
@@ -20,13 +26,14 @@ if not os.path.exists(save_folder):
 best_model_path = os.path.join(save_folder, "best_model.pth")
 latest_model_path = os.path.join(save_folder, "latest_model.pth")
 
-num_epochs = 2  # 需修改
+num_epochs = 10  # 需修改
+batch_size = 64*4  # 需修改，单卡图像数量×GPU数量
 start_lr = 0.01
-batch_size = 48*4  # 需修改，每个GPU上的图像数量×GPU数量
+num_workers = 4  # 实测设置为16或32时严重变慢，4比8要稍微快一点
 
 os.environ['CUDA_VISIBLE_DEVICES'] = "0,1,2,3"
 gpus = [i for i in range(torch.cuda.device_count())]
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # 数据集的transform
 data_transforms = {
@@ -45,7 +52,7 @@ data_transforms = {
 # ImageFolder: 按文件夹给数据分类，一个文件夹为一类，label会自动标注好
 image_datasets = {x: datasets.ImageFolder(os.path.join(data_dir, x), data_transforms[x])
                   for x in ['train', "val"]}
-dataloaders = {x: DataLoader(image_datasets[x], batch_size=batch_size, shuffle=True, num_workers=12)
+dataloaders = {x: DataLoader(image_datasets[x], batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
                for x in ['train', "val"]}
 dataset_sizes = {x: len(image_datasets[x]) for x in ['train', "val"]}
 
@@ -59,7 +66,8 @@ def train_model(model, criterion, optimizer, scheduler, num_epochs=20):
 
     best_model_wts = copy.deepcopy(model.module.state_dict())
     latest_model_wts = copy.deepcopy(model.module.state_dict())
-    best_acc = 0.0
+    best_val_acc = 0.0
+    best_epoch = 1
 
     for epoch in range(num_epochs):
         # Each epoch has a training and validation phase
@@ -74,8 +82,8 @@ def train_model(model, criterion, optimizer, scheduler, num_epochs=20):
 
             # Iterate over data.
             for i, (inputs, labels) in enumerate(dataloaders[phase]):
-                inputs = inputs.to(device)
-                labels = labels.to(device)
+                inputs = inputs.to(device, non_blocking=True)
+                labels = labels.to(device, non_blocking=True)
 
                 # zero the parameter gradients
                 optimizer.zero_grad()
@@ -84,9 +92,9 @@ def train_model(model, criterion, optimizer, scheduler, num_epochs=20):
                 # track history if only in train
                 with torch.set_grad_enabled(phase == 'train'):
                     outputs = model(inputs)
-                    _, preds = torch.max(outputs, 1)  # 使用hard target，即one hot
                     loss = criterion(outputs, labels)
-
+                    _, preds = torch.max(outputs, 1)
+                    
                     # backward + optimize only if in training phase
                     if phase == 'train':
                         loss.backward()
@@ -107,8 +115,9 @@ def train_model(model, criterion, optimizer, scheduler, num_epochs=20):
             print('{} {} Epoch: {}/{} Loss: {:.4f} Acc: {:.4f}'.format(timestamp, phase, epoch+1, num_epochs, epoch_loss, epoch_acc))
 
             # deep copy the model
-            if epoch_acc > best_acc:
-                best_acc = epoch_acc
+            if phase == "val" and epoch_acc > best_val_acc:
+                best_val_acc = epoch_acc
+                best_epoch = epoch
                 best_model_wts = copy.deepcopy(model.module.state_dict())
                 torch.save(best_model_wts, best_model_path)
         
@@ -116,12 +125,12 @@ def train_model(model, criterion, optimizer, scheduler, num_epochs=20):
 
     time_elapsed = time.time() - since
     print('Training complete in {:.0f}m {:.0f}s'.format(time_elapsed // 60, time_elapsed % 60))
-    print('Best Train Acc: {:4f}'.format(best_acc))
+    print('Best Val Acc: {:4f} in epoch {}'.format(best_val_acc, best_epoch))
 
 
 # Finetuning, 构建网络
-model = Resnet18()
-model = model.cuda()
+model = Resnet18(num_classes=num_classes)
+model = model.to(device)
 model = nn.DataParallel(model, device_ids=gpus)
 
 criterion = nn.CrossEntropyLoss()

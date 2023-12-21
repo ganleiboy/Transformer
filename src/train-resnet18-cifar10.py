@@ -12,10 +12,12 @@ from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 from resnet import Resnet18
 
+
 # 参数 ==========================================================================
 data_dir = '../data/cifar10/'  # 需修改
 save_folder = "../output/resnet18-cifar10-01/"
-os.makedirs(save_folder)
+if not os.path.exists(save_folder):
+    os.makedirs(save_folder)
 best_model_path = os.path.join(save_folder, "best_model.pth")
 latest_model_path = os.path.join(save_folder, "latest_model.pth")
 
@@ -83,7 +85,6 @@ def train_model(model, criterion, optimizer, scheduler, num_epochs=20):
                 # track history if only in train
                 with torch.set_grad_enabled(phase == 'train'):
                     outputs = model(inputs)
-                    _, preds = torch.max(outputs, 1)  # 使用hard target，即one hot
                     loss = criterion(outputs, labels)
 
                     # backward + optimize only if in training phase
@@ -93,6 +94,7 @@ def train_model(model, criterion, optimizer, scheduler, num_epochs=20):
 
                 # statistics
                 running_loss += loss.item() * inputs.size(0)
+                _, preds = torch.max(outputs, 1)  # 使用hard target，即one hot
                 running_corrects += torch.sum(preds == labels.data)
                 if i%100 == 0:
                     timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
@@ -119,13 +121,13 @@ def train_model(model, criterion, optimizer, scheduler, num_epochs=20):
 
 
 # Finetuning, 构建网络
-model = Resnet18()
-model = model.cuda()
+model = Resnet18(num_classes=num_classes)
+model = model.to(device)
 model = nn.DataParallel(model, device_ids=gpus)
 
 criterion = nn.CrossEntropyLoss()
 optimizer = torch.optim.SGD(model.parameters(), lr=start_lr, momentum=0.9)
-step_lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.2)
+step_lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.2)
 
 # Train
 train_model(model, criterion, optimizer, step_lr_scheduler, num_epochs=num_epochs)
