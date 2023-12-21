@@ -2,6 +2,7 @@
 # 使用DistributedDataParallel比DataParallel训练速度快一倍，10个epoch约5分钟
 # refer：https://blog.csdn.net/weixin_43229348/article/details/124112404
 # refer：https://blog.csdn.net/yaohaishen/article/details/127471992
+# refer：https://blog.csdn.net/Komach/article/details/130765773
 # usage：python -m torch.distributed.run --nproc_per_node=4 train-resnet18-miniimagenet-ddp.py
 # ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 import os
@@ -11,7 +12,6 @@ from copy import deepcopy
 import torch
 import torch.nn as nn
 import torch.distributed as dist
-# import torchvision.transforms as transforms
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torchvision import datasets, transforms
 from torch.utils.data import distributed, DataLoader
@@ -19,10 +19,16 @@ from torch.utils.data import distributed, DataLoader
 from resnet import Resnet18
 
 
+def save_log(str):
+    global logpath
+    with open(logpath, 'a', encoding="utf-8") as file:
+        file.write(str)
+
+
 def setup_distributed(rank, local_rank):
     # 设置分布式环境
     torch.cuda.set_device(rank % torch.cuda.device_count())
-    dist.init_process_group(backend="nccl")
+    dist.init_process_group(backend="nccl")  # 初始化进程组，使用NCCL作为通信后端
     device = torch.device("cuda", local_rank)  # 分布式训练只能使用GPU
     print(f"[init] == local rank: {local_rank}, global rank: {rank} ==")
     return device
@@ -52,13 +58,12 @@ def define_dataloader(data_dir, batch_size, workers):
     }
     train_dataset = datasets.ImageFolder(os.path.join(data_dir, "train"), data_transforms["train"])
     val_dataset = datasets.ImageFolder(os.path.join(data_dir, "val"), data_transforms["val"])
-    train_sampler = distributed.DistributedSampler(train_dataset, shuffle=True)
+    train_sampler = distributed.DistributedSampler(train_dataset, shuffle=True)  # 分布式训练使用分布式采样器
     train_loader = DataLoader(train_dataset,
                             batch_size=batch_size,
                             num_workers=workers,
                             pin_memory=True,
-                            sampler=train_sampler,
-    )
+                            sampler=train_sampler)
     val_loader = DataLoader(val_dataset, 
                             batch_size=batch_size, 
                             shuffle=True, 
@@ -87,7 +92,8 @@ def val(ep, net, val_loader, criterion, best_val_acc, best_epoch, best_model_pat
             best_epoch = ep
             best_model_wts = deepcopy(net.module.state_dict())
             torch.save(best_model_wts, best_model_path)
-
+        
+        save_log("val epoch:{} | loss:{} | acc:{}\n".format(ep, val_loss / len(val_loader), epoch_acc))
         print("   == val epoch: {} | loss: {:.3f} | acc: {:6.3f}%".format(
                 ep, val_loss / len(val_loader), 100.0 * epoch_acc))
     return best_val_acc,best_epoch
@@ -118,12 +124,13 @@ def train(net, train_loader, val_loader, criterion, optimizer, rank, best_model_
             total += targets.size(0)
             correct += torch.eq(outputs.argmax(dim=1), targets).sum().item()
 
-            if rank == 0 and ((idx + 1) % 50 == 0 or (idx + 1) == len(train_loader)):
+            if rank == 0 and ((idx + 1) % 100 == 0 or (idx + 1) == len(train_loader)):
                 print("   == train step: [{:3}/{}] [{}/{}] | loss: {:.3f} | acc: {:6.3f}%".format(
                         idx + 1, len(train_loader), ep, EPOCHS, train_loss / (idx + 1),
                         100.0 * correct / total))
         # 模型验证, 只在主卡上进行计算即可, 每张卡上计算结果几乎一样
         if rank == 0:
+            save_log("train epoch:{} | loss:{} | acc:{}\n".format(ep, train_loss/len(train_loader), correct / total))
             best_val_acc,best_epoch = val(ep, net, val_loader, criterion, best_val_acc, best_epoch, best_model_path)
 
     if rank == 0:
@@ -136,15 +143,16 @@ def train(net, train_loader, val_loader, criterion, optimizer, rank, best_model_
 
 if __name__ == "__main__":
     BATCH_SIZE = 32 * 4  # bts=32*4时，每张卡显存占用8.5GB
-    EPOCHS = 10
+    EPOCHS = 100
     WORKDERS = 4
     data_dir = '../data/miniImagenet/'
-    save_folder = "../output/resnet18-miniImagenet-02/"
+    save_folder = "../output/resnet18-miniImagenet-01/"
     if not os.path.exists(save_folder):
         os.makedirs(save_folder)
     best_model_path = os.path.join(save_folder, "best_model.pth")
     latest_model_path = os.path.join(save_folder, "latest_model.pth")
-
+    global logpath
+    logpath = os.path.join(save_folder, "train_log.txt")
 
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])
