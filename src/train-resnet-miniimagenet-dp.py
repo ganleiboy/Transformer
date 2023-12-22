@@ -16,7 +16,7 @@ from resnet import Resnet18
 import multiprocessing
 # from apex import amp
 
-torch.backends.cudnn.benchmark = True
+torch.backends.cudnn.benchmark = True  # 设置前后好像没啥区别
 
 # 参数 ==========================================================================
 data_dir = '../data/miniImagenet/'  # 需修改
@@ -26,7 +26,7 @@ if not os.path.exists(save_folder):
 best_model_path = os.path.join(save_folder, "best_model.pth")
 latest_model_path = os.path.join(save_folder, "latest_model.pth")
 
-num_epochs = 10  # 需修改
+num_epochs = 60  # 需修改
 batch_size = 64*4  # 需修改，单卡图像数量×GPU数量
 start_lr = 0.01
 num_workers = 4  # 实测设置为16或32时严重变慢，4比8要稍微快一点
@@ -135,7 +135,7 @@ model = nn.DataParallel(model, device_ids=gpus)
 
 criterion = nn.CrossEntropyLoss()
 optimizer = torch.optim.SGD(model.parameters(), lr=start_lr, momentum=0.9)
-step_lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.2)
+step_lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.5)
 
 # Train
 train_model(model, criterion, optimizer, step_lr_scheduler, num_epochs=num_epochs)

@@ -1,9 +1,9 @@
 # ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
-# 使用DistributedDataParallel比DataParallel训练速度快一倍，10个epoch约5分钟
+# 蒸馏学习
 # refer：https://blog.csdn.net/weixin_43229348/article/details/124112404
 # refer：https://blog.csdn.net/yaohaishen/article/details/127471992
 # refer：https://blog.csdn.net/Komach/article/details/130765773
-# usage：python -m torch.distributed.run --nproc_per_node=4 train-resnet18-miniimagenet-ddp.py
+# usage：python -m torch.distributed.run --nproc_per_node=4 train-resnet18-miniimagenet-ddp-distill.py
 # ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 import os
 os.environ['CUDA_VISIBLE_DEVICES'] = "0,1,2,3" # 尽量在torch被导入之前设置
@@ -18,7 +18,7 @@ from torch.utils.data import distributed, DataLoader
 from torchsummary import summary
 
 from resnet import Resnet18
-from distill import StudentNet
+from distill import StudentNet, DistillationLoss
 from tools import plot_logs
 
 
@@ -37,14 +37,21 @@ def setup_distributed(rank, local_rank):
     return device
 
 
-def define_network(device, local_rank, num_classes=100):
+def define_network(device, local_rank, num_classes=100, teacher_model_weights_path=None):
     # 定义网络架构
-    # net = Resnet18(num_classes=num_classes)  # 教师网络
-    net = StudentNet(num_classes=num_classes)  # 学生网络
-    summary(net, (3, 84, 84), batch_size=-1, device="cpu")
-    net = net.to(device)
-    net = DDP(net, device_ids=[local_rank], output_device=local_rank)
-    return net
+    # 教师网络，需要加载预训练权重
+    net_tch = Resnet18(num_classes=num_classes)
+    checkpoint = torch.load(teacher_model_weights_path)
+    net_tch.load_state_dict(checkpoint)
+    net_tch.to(device)
+    net_tch = DDP(net_tch, device_ids=[local_rank], output_device=local_rank)
+
+    # 学生网络，随机初始化
+    net_stu = StudentNet(num_classes=num_classes)  
+    # summary(net_stu, (3, 84, 84), batch_size=-1, device="cpu")
+    net_stu = net_stu.to(device)
+    net_stu = DDP(net_stu, device_ids=[local_rank], output_device=local_rank)
+    return net_stu, net_tch
 
 
 def define_dataloader(data_dir, batch_size, workers):
@@ -104,24 +111,29 @@ def val(ep, net, val_loader, criterion, best_val_acc, best_epoch, best_model_pat
     return best_val_acc,best_epoch
 
 
-def train(net, train_loader, val_loader, criterion, optimizer, scheduler, rank, best_model_path, latest_model_path):
+def train(net_stu, net_tch, train_loader, val_loader, criterion, optimizer, scheduler, rank, best_model_path, latest_model_path):
     since = time.time()
-    best_model_wts   = deepcopy(net.module.state_dict())
-    latest_model_wts = deepcopy(net.module.state_dict())
+    best_model_wts   = deepcopy(net_stu.module.state_dict())
+    latest_model_wts = deepcopy(net_stu.module.state_dict())
     best_val_acc = 0.0
     best_epoch = 1
     for ep in range(1, EPOCHS + 1):
         # 模型训练
-        net.train()
+        net_stu.train()
+        net_tch.eval()  # 设置教师模型的状态
         train_loss = correct = total = 0
         lr = 0.
         train_loader.sampler.set_epoch(ep)
 
         for idx, (inputs, targets) in enumerate(train_loader):
             inputs, targets = inputs.to(device), targets.to(device)
-            outputs = net(inputs)
+            # 计算学生和教师模型的输出
+            outputs_stu = net_stu(inputs)
+            with torch.no_grad():
+                outputs_tch = net_tch(inputs)
+            # 计算loss
+            loss = criterion(outputs_stu, targets, distill_type="soft", teacher_out=outputs_tch)
 
-            loss = criterion(outputs, targets)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -129,7 +141,7 @@ def train(net, train_loader, val_loader, criterion, optimizer, scheduler, rank, 
             lr = optimizer.state_dict()["param_groups"][0]["lr"]
             train_loss += loss.item()
             total += targets.size(0)
-            correct += torch.eq(outputs.argmax(dim=1), targets).sum().item()
+            correct += torch.eq(outputs_stu.argmax(dim=1), targets).sum().item()
 
             if rank == 0 and ((idx + 1) % 100 == 0 or (idx + 1) == len(train_loader)):
                 print("   == train step: [{:3}/{}] [{}/{}] | loss: {:.3f} | acc: {:6.3f}%".format(
@@ -140,10 +152,10 @@ def train(net, train_loader, val_loader, criterion, optimizer, scheduler, rank, 
         # 模型验证, 只在主卡上进行计算即可, 每张卡上计算结果几乎一样
         if rank == 0:
             save_log("train epoch:{} | lr:{:.6f} | loss:{:.6f} | acc:{:.4f}\n".format(ep, lr, train_loss/len(train_loader), correct / total))
-            best_val_acc,best_epoch = val(ep, net, val_loader, criterion, best_val_acc, best_epoch, best_model_path)
+            best_val_acc,best_epoch = val(ep, net_stu, val_loader, criterion, best_val_acc, best_epoch, best_model_path)
 
     if rank == 0:
-        torch.save(net.module.state_dict(), latest_model_path)
+        torch.save(net_stu.module.state_dict(), latest_model_path)
         time_elapsed = time.time() - since
         print('Training complete in {:.0f}m {:.0f}s'.format(time_elapsed // 60, time_elapsed % 60))
         print('Best Val Acc: {:.4f} in epoch {}.'.format(best_val_acc, best_epoch))
@@ -154,7 +166,7 @@ def train(net, train_loader, val_loader, criterion, optimizer, scheduler, rank, 
 
 if __name__ == "__main__":
     BATCH_SIZE = 32 * 4  # bts=32*4时，每张卡显存占用8.5GB
-    EPOCHS = 60
+    EPOCHS = 100
     WORKDERS = 4  # 实测设置为16或32时严重变慢，4比8要稍微快一点
     data_dir = '../data/miniImagenet/'
     save_folder = "../output/resnet18-miniImagenet-11/"
@@ -163,25 +175,24 @@ if __name__ == "__main__":
     logpath = os.path.join(save_folder, "train_log.txt")
     best_model_path = os.path.join(save_folder, "best_model.pth")
     latest_model_path = os.path.join(save_folder, "latest_model.pth")
+    # 教师模型的权重保存位置
+    teacher_model_weights_path = "../output/resnet18-miniImagenet-04/latest_model.pth"
     
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])
     device = setup_distributed(rank, local_rank)
     train_loader, val_loader, num_classes = define_dataloader(data_dir, BATCH_SIZE, WORKDERS)
-    net = define_network(device, local_rank, num_classes)
+    net_stu, net_tch = define_network(device, local_rank, num_classes, teacher_model_weights_path)
     
-    criterion = nn.CrossEntropyLoss()
-    
+    # criterion = nn.CrossEntropyLoss()
+    criterion = DistillationLoss(alpha=1.0, temp=1.0)
+
     # optimizer = torch.optim.SGD(net.parameters(), lr=0.01, momentum=0.9, weight_decay=0.0001, nesterov=True)
-    optimizer = torch.optim.SGD(net.parameters(), lr=0.01, momentum=0.9)
+    optimizer = torch.optim.SGD(net_stu.parameters(), lr=0.01, momentum=0.9)
     step_lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.5)
 
-    # optimizer = torch.optim.Adam(net.parameters(), lr=0.1, betas=(0.9, 0.999))
-    # warmup_steps = 2
-    # warmup_scheduler = torch.optim.LambdaLR(optimizer, lr_lambda=lambda step: step / warmup_steps)
-    
     if rank == 0:
         print("==============  Start Training  ============== \n")
 
-    train(net, train_loader, val_loader, criterion, optimizer, step_lr_scheduler, rank, best_model_path, latest_model_path)
+    train(net_stu, net_tch, train_loader, val_loader, criterion, optimizer, step_lr_scheduler, rank, best_model_path, latest_model_path)
     # print("+"*30 + " end " + "+"*30)
