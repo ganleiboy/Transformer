@@ -17,6 +17,7 @@ from torchvision import datasets, transforms
 from torch.utils.data import distributed, DataLoader
 
 from resnet import Resnet18
+from tools import plot_logs
 
 
 def save_log(str):
@@ -93,7 +94,7 @@ def val(ep, net, val_loader, criterion, best_val_acc, best_epoch, best_model_pat
             best_model_wts = deepcopy(net.module.state_dict())
             torch.save(best_model_wts, best_model_path)
         
-        save_log("val epoch:{} | loss:{} | acc:{}\n".format(ep, val_loss / len(val_loader), epoch_acc))
+        save_log("val epoch:{} | loss:{:.6f} | acc:{:.4f}\n".format(ep, val_loss / len(val_loader), epoch_acc))
         print("   == val epoch: {} | loss: {:.3f} | acc: {:6.3f}%".format(
                 ep, val_loss / len(val_loader), 100.0 * epoch_acc))
     return best_val_acc,best_epoch
@@ -109,6 +110,7 @@ def train(net, train_loader, val_loader, criterion, optimizer, rank, best_model_
         # 模型训练
         net.train()
         train_loss = correct = total = 0
+        lr = 0.
         train_loader.sampler.set_epoch(ep)
 
         for idx, (inputs, targets) in enumerate(train_loader):
@@ -120,6 +122,7 @@ def train(net, train_loader, val_loader, criterion, optimizer, rank, best_model_
             loss.backward()
             optimizer.step()
 
+            lr = optimizer.state_dict()["param_groups"][0]["lr"]
             train_loss += loss.item()
             total += targets.size(0)
             correct += torch.eq(outputs.argmax(dim=1), targets).sum().item()
@@ -130,7 +133,7 @@ def train(net, train_loader, val_loader, criterion, optimizer, rank, best_model_
                         100.0 * correct / total))
         # 模型验证, 只在主卡上进行计算即可, 每张卡上计算结果几乎一样
         if rank == 0:
-            save_log("train epoch:{} | loss:{} | acc:{}\n".format(ep, train_loss/len(train_loader), correct / total))
+            save_log("train epoch:{} | lr:{:.6f} | loss:{:.6f} | acc:{:.4f}\n".format(ep, lr, train_loss/len(train_loader), correct / total))
             best_val_acc,best_epoch = val(ep, net, val_loader, criterion, best_val_acc, best_epoch, best_model_path)
 
     if rank == 0:
@@ -138,22 +141,23 @@ def train(net, train_loader, val_loader, criterion, optimizer, rank, best_model_
         time_elapsed = time.time() - since
         print('Training complete in {:.0f}m {:.0f}s'.format(time_elapsed // 60, time_elapsed % 60))
         print('Best Val Acc: {:.4f} in epoch {}.'.format(best_val_acc, best_epoch))
+        global logpath
+        plot_logs(logpath, logpath.replace("txt", "jpg"))
         print("\n==============  Training Finished  ============== \n")
 
 
 if __name__ == "__main__":
     BATCH_SIZE = 32 * 4  # bts=32*4时，每张卡显存占用8.5GB
     EPOCHS = 100
-    WORKDERS = 4
+    WORKDERS = 4  # 实测设置为16或32时严重变慢，4比8要稍微快一点
     data_dir = '../data/miniImagenet/'
     save_folder = "../output/resnet18-miniImagenet-01/"
     if not os.path.exists(save_folder):
         os.makedirs(save_folder)
+    logpath = os.path.join(save_folder, "train_log.txt")
     best_model_path = os.path.join(save_folder, "best_model.pth")
     latest_model_path = os.path.join(save_folder, "latest_model.pth")
-    global logpath
-    logpath = os.path.join(save_folder, "train_log.txt")
-
+    
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])
     device = setup_distributed(rank, local_rank)
@@ -164,6 +168,7 @@ if __name__ == "__main__":
     optimizer = torch.optim.SGD(net.parameters(), lr=0.01, momentum=0.9, weight_decay=0.0001, nesterov=True)
 
     if rank == 0:
-        print("=======  Training  ======= \n")
+        print("==============  Start Training  ============== \n")
 
     train(net, train_loader, val_loader, criterion, optimizer, rank, best_model_path, latest_model_path)
+    # print("+"*30 + " end " + "+"*30)

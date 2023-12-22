@@ -1,9 +1,8 @@
-import torch
-import torch.nn as nn
-from torchsummary import summary
-from torchvision.models import resnet18  # 以 resnet18 为例
- 
+def my_function():
+    # global var
+    print(var)
 
-model = resnet18()
-summary(model, (3, 224, 224), device="cpu")
-print("end.")
+if __name__ == "__main__":
+    var = 20
+    my_function()
+    print("end.")
